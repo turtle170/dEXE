@@ -2,3 +2,8 @@
 **/*.exe
 **/*.pdb
 Cargo.lock
+.idea/
+.vscode/
+*.user
+manifests/**/*.yaml.user
+manifests/**/*.yaml.local
