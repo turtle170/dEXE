@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://aka.ms/winget-manifest.locale.1.6.0.schema.json
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
 PackageIdentifier: dEXE.dEXE
 PackageVersion: 0.1.0
 PackageLocale: en-US
@@ -20,4 +20,4 @@ Tags:
   - reverse-engineering
   - x86_64
 ManifestType: defaultLocale
-ManifestVersion: 1.6.0
+ManifestVersion: 1.12.0
