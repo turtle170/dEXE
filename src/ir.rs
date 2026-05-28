@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::cfg::{BlockId, ControlFlowGraph, Terminator};
+use crate::cfg::{BlockId, ControlFlowGraph};
 
 // ---------------------------------------------------------------------------
 // Core IR types
@@ -105,11 +105,14 @@ pub enum Opcode {
     Test { lhs: Operand, rhs: Operand },
     Jmp { target: u64 },
     Jcc { condition: Condition, target: u64, fallthrough: u64 },
-    Call { target: CallTarget },
+    Cmovcc { condition: Condition, dst: VarId, src: Operand },
+    Setcc { condition: Condition, dst: VarId },
+    Call { target: CallTarget, fallthrough: u64 },
     Ret,
     Nop,
     Push { src: Operand },
     Pop { dst: VarId },
+    AtomicRMW { op: String, addr: Operand, src: Operand },
     Unknown { mnemonic: String, addr: u64 },
 }
 
@@ -415,36 +418,6 @@ fn parse_condition_suffix(mnemonic: &str) -> Condition {
     }
 }
 
-/// Parse a condition string from the CFG's `Terminator::ConditionalJump`.
-/// The CFG stores the mnemonic itself (e.g. "je", "jne").
-fn parse_condition_string(cond_str: &str) -> Condition {
-    let s = cond_str.trim().to_lowercase();
-    match s.as_str() {
-        "equal" | "e" | "z" | "je" | "jz"                      => Condition::Equal,
-        "not_equal" | "ne" | "nz" | "jne" | "jnz"              => Condition::NotEqual,
-        "less" | "l" | "nge" | "jl" | "jnge"                   => Condition::Less,
-        "less_equal" | "le" | "ng" | "jle" | "jng"             => Condition::LessEqual,
-        "greater" | "g" | "nle" | "jg" | "jnle"               => Condition::Greater,
-        "greater_equal" | "ge" | "nl" | "jge" | "jnl"         => Condition::GreaterEqual,
-        "below" | "b" | "nae" | "c" | "jb" | "jnae" | "jc"    => Condition::Below,
-        "below_equal" | "be" | "na" | "jbe" | "jna"            => Condition::BelowEqual,
-        "above" | "a" | "nbe" | "ja" | "jnbe"                  => Condition::Above,
-        "above_equal" | "ae" | "nb" | "nc" | "jae" | "jnb" | "jnc" => Condition::AboveEqual,
-        "sign" | "s" | "js"                                     => Condition::Sign,
-        "not_sign" | "ns" | "jns"                               => Condition::NotSign,
-        "overflow" | "o" | "jo"                                 => Condition::Overflow,
-        "not_overflow" | "no" | "jno"                           => Condition::NotOverflow,
-        "parity" | "p" | "pe" | "jp" | "jpe"                   => Condition::Parity,
-        "not_parity" | "np" | "po" | "jnp" | "jpo"             => Condition::NotParity,
-        _ => {
-            log::warn!(
-                "Unknown condition string '{}', defaulting to Equal",
-                cond_str
-            );
-            Condition::Equal
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Instruction lifting helpers
@@ -516,9 +489,17 @@ pub fn lift_function(cfg: &ControlFlowGraph) -> IRFunction {
         // ---------------------------------------------------------------
         // Lift each disassembled instruction
         // ---------------------------------------------------------------
+
         for insn in &basic_block.instructions {
-            let mnemonic = insn.mnemonic.to_lowercase();
-            let mnemonic_str = mnemonic.as_str();
+            let mnemonic_raw = insn.mnemonic.to_lowercase();
+            let mut mnemonic_str = mnemonic_raw.as_str();
+            let is_lock = if mnemonic_str.starts_with("lock ") {
+                mnemonic_str = mnemonic_str.trim_start_matches("lock ");
+                true
+            } else {
+                false
+            };
+            let mnemonic = mnemonic_str.to_string();
             let operands = parse_operands(&insn.op_str);
 
             let opcode = match mnemonic_str {
@@ -610,7 +591,7 @@ pub fn lift_function(cfg: &ControlFlowGraph) -> IRFunction {
                 // --- CALL ---
                 "call" => {
                     if !operands.is_empty() {
-                        lift_call(&operands[0], &versions)
+                        lift_call(&operands[0], &versions, insn.address + insn.size as u64)
                     } else {
                         Opcode::Unknown { mnemonic: mnemonic.clone(), addr: insn.address }
                     }
@@ -623,6 +604,42 @@ pub fn lift_function(cfg: &ControlFlowGraph) -> IRFunction {
                 "jmp" => {
                     if !operands.is_empty() {
                         lift_jmp(&operands[0], &versions)
+                    } else {
+                        Opcode::Unknown { mnemonic: mnemonic.clone(), addr: insn.address }
+                    }
+                }
+
+                // --- Atomic RMW (lock prefix) ---
+                m if is_lock => {
+                    if operands.len() >= 2 {
+                        let dst_op = parse_single_operand(&operands[0], &versions);
+                        let src_op = parse_single_operand(&operands[1], &versions);
+                        Opcode::AtomicRMW { op: m.to_string(), addr: dst_op, src: src_op }
+                    } else {
+                        Opcode::Unknown { mnemonic: mnemonic.clone(), addr: insn.address }
+                    }
+                }
+
+                // --- Conditional moves ---
+                m if m.starts_with("cmov") => {
+                    if operands.len() >= 2 {
+                        let condition = parse_condition_suffix(&m[4..]);
+                        let src = parse_single_operand(&operands[1], &versions);
+                        let dst_base = dst_register(&operands[0]).unwrap_or(VarBase::RAX);
+                        let dst = new_version(&mut versions, dst_base);
+                        Opcode::Cmovcc { condition, dst, src }
+                    } else {
+                        Opcode::Unknown { mnemonic: mnemonic.clone(), addr: insn.address }
+                    }
+                }
+
+                // --- SetCC ---
+                m if m.starts_with("set") => {
+                    if operands.len() >= 1 {
+                        let condition = parse_condition_suffix(&m[3..]);
+                        let dst_base = dst_register(&operands[0]).unwrap_or(VarBase::RAX);
+                        let dst = new_version(&mut versions, dst_base);
+                        Opcode::Setcc { condition, dst }
                     } else {
                         Opcode::Unknown { mnemonic: mnemonic.clone(), addr: insn.address }
                     }
@@ -688,11 +705,11 @@ pub fn lift_function(cfg: &ControlFlowGraph) -> IRFunction {
                 }
 
                 // --- INT3 / UD2 / HLT / INT ---
-                "int3" | "ud2" | "hlt" | "int" => Opcode::Nop,
+                "int3" | "ud2" | "hlt" | "int" => Opcode::Ret,
 
                 // --- SYSCALL ---
                 "syscall" => Opcode::Call {
-                    target: CallTarget::External("syscall".to_string()),
+                    target: CallTarget::External("syscall".to_string()), fallthrough: insn.address + insn.size as u64,
                 },
 
                 // --- Default: unknown ---
@@ -714,62 +731,7 @@ pub fn lift_function(cfg: &ControlFlowGraph) -> IRFunction {
             });
         }
 
-        // ---------------------------------------------------------------
-        // Lift the block terminator
-        // ---------------------------------------------------------------
-        let term_addr = basic_block.end_addr;
-
-        match &basic_block.terminator {
-            Terminator::Jump(target_bid) => {
-                let target_addr = cfg
-                    .blocks
-                    .get(target_bid)
-                    .map(|b| b.start_addr)
-                    .unwrap_or(0);
-                ir_instructions.push(IRInstruction {
-                    addr: term_addr,
-                    opcode: Opcode::Jmp { target: target_addr },
-                });
-            }
-            Terminator::ConditionalJump {
-                taken,
-                fallthrough,
-                condition,
-            } => {
-                let taken_addr = cfg.blocks.get(taken).map(|b| b.start_addr).unwrap_or(0);
-                let ft_addr = cfg
-                    .blocks
-                    .get(fallthrough)
-                    .map(|b| b.start_addr)
-                    .unwrap_or(0);
-                let cond = parse_condition_string(condition);
-                ir_instructions.push(IRInstruction {
-                    addr: term_addr,
-                    opcode: Opcode::Jcc {
-                        condition: cond,
-                        target: taken_addr,
-                        fallthrough: ft_addr,
-                    },
-                });
-            }
-            Terminator::Return | Terminator::Halt => {
-                ir_instructions.push(IRInstruction {
-                    addr: term_addr,
-                    opcode: Opcode::Ret,
-                });
-            }
-            Terminator::Call { target, fallthrough: _ } => {
-                ir_instructions.push(IRInstruction {
-                    addr: term_addr,
-                    opcode: Opcode::Call {
-                        target: CallTarget::Direct(*target),
-                    },
-                });
-            }
-            Terminator::Fallthrough(_) => {
-                // Implicit fallthrough – no IR instruction needed.
-            }
-        }
+        // Terminator handling is now done purely by the instruction lifter above.
 
         ir_blocks.insert(
             block_id,
@@ -863,19 +825,19 @@ fn lift_unary_reg(
 }
 
 /// Lift a call instruction from a single operand string.
-fn lift_call(target_str: &str, versions: &HashMap<VarBase, u32>) -> Opcode {
+fn lift_call(target_str: &str, versions: &HashMap<VarBase, u32>, fallthrough: u64) -> Opcode {
     let target_str = target_str.trim();
     if is_memory_operand(target_str) {
         let op = parse_memory_operand(target_str, versions);
-        Opcode::Call { target: CallTarget::Indirect(op) }
+        Opcode::Call { target: CallTarget::Indirect(op), fallthrough }
     } else if let Some(vb) = parse_register(target_str) {
         let op = Operand::Var(current_var(versions, vb));
-        Opcode::Call { target: CallTarget::Indirect(op) }
+        Opcode::Call { target: CallTarget::Indirect(op), fallthrough: 0 }
     } else if let Some(addr) = parse_immediate(target_str) {
-        Opcode::Call { target: CallTarget::Direct(addr as u64) }
+        Opcode::Call { target: CallTarget::Direct(addr as u64), fallthrough }
     } else {
         // Might be a symbol name
-        Opcode::Call { target: CallTarget::External(target_str.to_string()) }
+        Opcode::Call { target: CallTarget::External(target_str.to_string()), fallthrough }
     }
 }
 
@@ -887,10 +849,10 @@ fn lift_jmp(target_str: &str, versions: &HashMap<VarBase, u32>) -> Opcode {
     } else if is_memory_operand(target_str) {
         // Indirect jump – model as indirect call for now
         let op = parse_memory_operand(target_str, versions);
-        Opcode::Call { target: CallTarget::Indirect(op) }
+        Opcode::Call { target: CallTarget::Indirect(op), fallthrough: 0 }
     } else if let Some(vb) = parse_register(target_str) {
         let op = Operand::Var(current_var(versions, vb));
-        Opcode::Call { target: CallTarget::Indirect(op) }
+        Opcode::Call { target: CallTarget::Indirect(op), fallthrough: 0 }
     } else {
         Opcode::Jmp { target: 0 }
     }

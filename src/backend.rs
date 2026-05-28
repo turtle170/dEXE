@@ -67,6 +67,20 @@ pub fn emit_c(functions: &[IRFunction], symbols: &SymbolTable) -> String {
     out.push_str("#include <string.h>\n");
     out.push_str("#include <stdlib.h>\n");
     out.push_str("#include <stddef.h>\n");
+    out.push_str("#include <stdatomic.h>\n");
+    out.push('\n');
+    out.push_str("typedef struct {\n");
+    out.push_str("    uint64_t rax, rbx, rcx, rdx;\n");
+    out.push_str("    uint64_t rsi, rdi, rsp, rbp;\n");
+    out.push_str("    uint64_t r8, r9, r10, r11;\n");
+    out.push_str("    uint64_t r12, r13, r14, r15;\n");
+    out.push_str("    uint64_t rflags;\n");
+    out.push_str("} CPU_State;\n");
+    out.push_str("CPU_State cpu = {0};\n");
+    out.push_str("uint8_t process_memory[16 * 1024 * 1024]; // 16MB\n");
+    out.push_str("void init_state(void) {\n");
+    out.push_str("    cpu.rsp = (uintptr_t)&process_memory[sizeof(process_memory) - 8];\n");
+    out.push_str("}\n");
     out.push('\n');
 
     // Build a set of addresses we are emitting as functions, for call resolution
@@ -87,12 +101,12 @@ pub fn emit_c(functions: &[IRFunction], symbols: &SymbolTable) -> String {
         for block in func.blocks.values() {
             for instr in &block.instructions {
                 match &instr.opcode {
-                    Opcode::Call { target: CallTarget::Direct(addr) } => {
+                    Opcode::Call { target: CallTarget::Direct(addr), .. } => {
                         if !emitted_addrs.contains(addr) {
                             extern_targets.insert(*addr);
                         }
                     }
-                    Opcode::Call { target: CallTarget::External(name) } => {
+                    Opcode::Call { target: CallTarget::External(name), .. } => {
                         extern_names.insert(name.clone());
                     }
                     _ => {}
@@ -178,23 +192,9 @@ fn emit_function(
     let fname = sanitise_c_ident(&func.name);
 
     writeln!(out, "uint64_t {}(void) {{", fname).unwrap();
+    out.push_str("    uint64_t tmp = 0; (void)tmp;\n");
 
-    // ── Register variables ───────────────────────────────────────────────
-    out.push_str("    /* Registers */\n");
-    out.push_str("    uint64_t rax = 0, rbx = 0, rcx = 0, rdx = 0;\n");
-    out.push_str("    uint64_t rsi = 0, rdi = 0, rsp = 0, rbp = 0;\n");
-    out.push_str("    uint64_t r8 = 0, r9 = 0, r10 = 0, r11 = 0;\n");
-    out.push_str("    uint64_t r12 = 0, r13 = 0, r14 = 0, r15 = 0;\n");
-    out.push_str("    uint64_t rflags = 0;\n");
-    out.push_str("    uint64_t tmp;\n");
-    out.push_str("    (void)tmp; (void)rflags;\n");
-    out.push('\n');
 
-    // ── Simulated stack ──────────────────────────────────────────────────
-    out.push_str("    /* Stack */\n");
-    out.push_str("    uint8_t _stack[8192];\n");
-    out.push_str("    rsp = (uint64_t)(uintptr_t)&_stack[8192];\n");
-    out.push('\n');
 
     // ── Blocks — emitted in address order ────────────────────────────────
     // Collect blocks and sort by start_addr
@@ -216,7 +216,7 @@ fn emit_function(
     }
 
     // ── Default return ───────────────────────────────────────────────────
-    out.push_str("    return rax;\n");
+    out.push_str("    return cpu.rax;\n");
     out.push_str("}\n");
 }
 
@@ -293,7 +293,7 @@ fn emit_instruction(
             let l = emit_operand(lhs);
             let r = emit_operand(rhs);
             format!(
-                "rflags = ((uint64_t)({l}) == (uint64_t)({r})) | \
+                "cpu.rflags = ((uint64_t)({l}) == (uint64_t)({r})) | \
                  (((uint64_t)({l}) < (uint64_t)({r})) << 1) | \
                  (((int64_t)({l}) < (int64_t)({r})) << 2);"
             )
@@ -301,61 +301,65 @@ fn emit_instruction(
         Opcode::Test { lhs, rhs } => {
             let l = emit_operand(lhs);
             let r = emit_operand(rhs);
-            format!("rflags = (({l} & {r}) == 0) ? 1 : 0;")
+            format!("cpu.rflags = (({l} & {r}) == 0) ? 1 : 0;")
         }
         Opcode::Jmp { target } => {
             format!("goto BLOCK_0x{:x};", target)
         }
         Opcode::Jcc { condition, target, fallthrough: _ } => {
-            let cond_expr = match condition {
-                Condition::Equal        => "(rflags & 1)".to_string(),
-                Condition::NotEqual     => "(!(rflags & 1))".to_string(),
-                Condition::Less         => "(rflags & 4)".to_string(),
-                Condition::GreaterEqual => "(!(rflags & 4))".to_string(),
-                Condition::Below        => "(rflags & 2)".to_string(),
-                Condition::AboveEqual   => "(!(rflags & 2))".to_string(),
-                Condition::Greater      => "(!(rflags & 1) && !(rflags & 4))".to_string(),
-                Condition::LessEqual    => "((rflags & 1) || (rflags & 4))".to_string(),
-                Condition::Above        => "(!(rflags & 1) && !(rflags & 2))".to_string(),
-                Condition::BelowEqual   => "((rflags & 1) || (rflags & 2))".to_string(),
-                Condition::Sign         => "(rflags)".to_string(),
-                Condition::NotSign      => "(!rflags)".to_string(),
-                Condition::Overflow     => "(rflags)".to_string(),
-                Condition::NotOverflow  => "(!rflags)".to_string(),
-                Condition::Parity       => "(rflags)".to_string(),
-                Condition::NotParity    => "(!rflags)".to_string(),
-            };
+            let cond_expr = get_cond_expr(condition);
             format!("if {} goto BLOCK_0x{:x};", cond_expr, target)
         }
-        Opcode::Call { target } => {
+
+        Opcode::Cmovcc { condition, dst, src } => {
+            let cond_expr = get_cond_expr(condition);
+            format!("{} = ({}) ? {} : {};", var_name(dst), cond_expr, emit_operand(src), var_name(dst))
+        }
+        Opcode::Setcc { condition, dst } => {
+            let cond_expr = get_cond_expr(condition);
+            format!("{} = ({}) ? 1 : 0;", var_name(dst), cond_expr)
+        }
+        Opcode::AtomicRMW { op, addr, src } => {
+            let op_c = match op.as_str() {
+                "add" => "__sync_fetch_and_add",
+                "sub" => "__sync_fetch_and_sub",
+                "and" => "__sync_fetch_and_and",
+                "or"  => "__sync_fetch_and_or",
+                "xor" => "__sync_fetch_and_xor",
+                _     => "/* unknown lock */",
+            };
+            format!("{}((uint64_t*)({}), {});", op_c, emit_mem_addr(addr), emit_operand(src))
+        }
+        Opcode::Call { target, fallthrough } => {
+            let mut s = String::new();
+            s.push_str(&format!("cpu.rsp -= 8; *(uint64_t*)(uintptr_t)(cpu.rsp) = 0x{:x}; ", fallthrough));
             match target {
                 CallTarget::Direct(addr) => {
                     let name = resolve_call_name(*addr, symbols, func_names, emitted_addrs);
-                    format!("rax = {}();", name)
+                    s.push_str(&format!("cpu.rax = {}();", name));
                 }
                 CallTarget::External(name) => {
-                    format!("rax = {}(rdi, rsi, rdx, rcx, r8, r9);", sanitise_c_ident(name))
+                    s.push_str(&format!("cpu.rax = {}(cpu.rdi, cpu.rsi, cpu.rdx, cpu.rcx, cpu.r8, cpu.r9);", sanitise_c_ident(name)));
                 }
                 CallTarget::Indirect(op) => {
-                    format!(
-                        "rax = ((uint64_t(*)(void))({}))();",
-                        emit_operand(op)
-                    )
+                    s.push_str(&format!("cpu.rax = ((uint64_t(*)(void))({}))();", emit_operand(op)));
                 }
             }
+            s
         }
+
         Opcode::Ret => {
-            "return rax;".to_string()
+            "return cpu.rax;".to_string()
         }
         Opcode::Push { src } => {
             format!(
-                "rsp -= 8; *(uint64_t*)(uintptr_t)rsp = {};",
+                "cpu.rsp -= 8; *(uint64_t*)(uintptr_t)(cpu.rsp) = {};",
                 emit_operand(src)
             )
         }
         Opcode::Pop { dst } => {
             format!(
-                "{} = *(uint64_t*)(uintptr_t)rsp; rsp += 8;",
+                "{} = *(uint64_t*)(uintptr_t)(cpu.rsp); cpu.rsp += 8;",
                 var_name(dst)
             )
         }
@@ -375,23 +379,23 @@ fn emit_instruction(
 /// Convert a VarId to the C variable name (ignoring SSA version).
 fn var_name(v: &VarId) -> &'static str {
     match v.base {
-        VarBase::RAX    => "rax",
-        VarBase::RBX    => "rbx",
-        VarBase::RCX    => "rcx",
-        VarBase::RDX    => "rdx",
-        VarBase::RSI    => "rsi",
-        VarBase::RDI    => "rdi",
-        VarBase::RSP    => "rsp",
-        VarBase::RBP    => "rbp",
-        VarBase::R8     => "r8",
-        VarBase::R9     => "r9",
-        VarBase::R10    => "r10",
-        VarBase::R11    => "r11",
-        VarBase::R12    => "r12",
-        VarBase::R13    => "r13",
-        VarBase::R14    => "r14",
-        VarBase::R15    => "r15",
-        VarBase::RFlags => "rflags",
+        VarBase::RAX    => "cpu.rax",
+        VarBase::RBX    => "cpu.rbx",
+        VarBase::RCX    => "cpu.rcx",
+        VarBase::RDX    => "cpu.rdx",
+        VarBase::RSI    => "cpu.rsi",
+        VarBase::RDI    => "cpu.rdi",
+        VarBase::RSP    => "cpu.rsp",
+        VarBase::RBP    => "cpu.rbp",
+        VarBase::R8     => "cpu.r8",
+        VarBase::R9     => "cpu.r9",
+        VarBase::R10    => "cpu.r10",
+        VarBase::R11    => "cpu.r11",
+        VarBase::R12    => "cpu.r12",
+        VarBase::R13    => "cpu.r13",
+        VarBase::R14    => "cpu.r14",
+        VarBase::R15    => "cpu.r15",
+        VarBase::RFlags => "cpu.rflags",
         VarBase::Temp(_)=> "tmp",
     }
 }
@@ -509,4 +513,25 @@ fn sanitise_c_ident(name: &str) -> String {
         result.insert(0, '_');
     }
     result
+}
+
+fn get_cond_expr(condition: &Condition) -> String {
+    match condition {
+        Condition::Equal        => "(cpu.rflags & 1)".to_string(),
+        Condition::NotEqual     => "(!(cpu.rflags & 1))".to_string(),
+        Condition::Less         => "(cpu.rflags & 4)".to_string(),
+        Condition::GreaterEqual => "(!(cpu.rflags & 4))".to_string(),
+        Condition::Below        => "(cpu.rflags & 2)".to_string(),
+        Condition::AboveEqual   => "(!(cpu.rflags & 2))".to_string(),
+        Condition::Greater      => "(!(cpu.rflags & 1) && !(cpu.rflags & 4))".to_string(),
+        Condition::LessEqual    => "((cpu.rflags & 1) || (cpu.rflags & 4))".to_string(),
+        Condition::Above        => "(!(cpu.rflags & 1) && !(cpu.rflags & 2))".to_string(),
+        Condition::BelowEqual   => "((cpu.rflags & 1) || (cpu.rflags & 2))".to_string(),
+        Condition::Sign         => "(cpu.rflags)".to_string(),
+        Condition::NotSign      => "(!cpu.rflags)".to_string(),
+        Condition::Overflow     => "(cpu.rflags)".to_string(),
+        Condition::NotOverflow  => "(!cpu.rflags)".to_string(),
+        Condition::Parity       => "(cpu.rflags)".to_string(),
+        Condition::NotParity    => "(!cpu.rflags)".to_string(),
+    }
 }

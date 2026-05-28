@@ -1,6 +1,6 @@
 [package]
 name = "dexe"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "An agentic x86_64 ELF/PE binary decompiler to functional C99"
 license = "Apache-2.0"

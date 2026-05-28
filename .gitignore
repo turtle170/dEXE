@@ -7,3 +7,4 @@ Cargo.lock
 *.user
 manifests/**/*.yaml.user
 manifests/**/*.yaml.local
+examples/*.c
